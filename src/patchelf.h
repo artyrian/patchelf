@@ -127,9 +127,7 @@ private:
 
     void rewriteHeaders(Elf_Addr phdrAddress);
 
-    void rewriteSectionsLibrary();
-
-    void rewriteSectionsExecutable();
+    void rewriteSectionsReal();
 
     void normalizeNoteSegments();
 

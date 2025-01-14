@@ -796,9 +796,9 @@ void ElfFile<ElfFileParamNames>::writeReplacedSections(Elf_Off & curOff,
 
 
 template<ElfFileParams>
-void ElfFile<ElfFileParamNames>::rewriteSectionsLibrary()
+void ElfFile<ElfFileParamNames>::rewriteSectionsReal()
 {
-    /* For dynamic libraries, we just place the replacement sections
+    /* To simplify things, we just place the replacement sections
        at the end of the file.  They're mapped into memory by a
        PT_LOAD segment located directly after the last virtual address
        page of other segments. */
@@ -832,7 +832,12 @@ void ElfFile<ElfFileParamNames>::rewriteSectionsLibrary()
     Elf_Addr pht_size = sizeof(Elf_Ehdr) + (phdrs.size() + num_notes + 1)*sizeof(Elf_Phdr);
     while( i < rdi(hdr()->e_shnum) && rdi(shdrs.at(i).sh_offset) <= pht_size ) {
         if (not haveReplacedSection(getSectionName(shdrs.at(i))))
+        {
+            std::string sectionName = getSectionName(shdrs.at(i));
+            if (rdi(shdrs.at(i).sh_type) == SHT_PROGBITS && sectionName != ".interp")
+                break;
             replaceSection(getSectionName(shdrs.at(i)), rdi(shdrs.at(i).sh_size));
+        }
         i++;
     }
     bool moveHeaderTableToTheEnd = rdi(hdr()->e_shoff) < pht_size;
@@ -855,20 +860,14 @@ void ElfFile<ElfFileParamNames>::rewriteSectionsLibrary()
     off_t binutilsQuirkPadding = 1;
     fileContents->resize(startOffset + neededSpace + binutilsQuirkPadding, 0);
 
-    /* Even though this file is of type ET_DYN, it could actually be
-       an executable.  For instance, Gold produces executables marked
-       ET_DYN as does LD when linking with pie. If we move PT_PHDR, it
+    /* For executables (even executable libraies), if we move PT_PHDR, it
        has to stay in the first PT_LOAD segment or any subsequent ones
        if they're continuous in memory due to linux kernel constraints
        (see BUGS). Since the end of the file would be after bss, we can't
        move PHDR there, we therefore choose to leave PT_PHDR where it is but
        move enough following sections such that we can add the extra PT_LOAD
        section to it. This PT_LOAD segment ensures the sections at the end of
-       the file are mapped into memory for ld.so to process.
-       We can't use the approach in rewriteSectionsExecutable()
-       since DYN executables tend to start at virtual address 0, so
-       rewriteSectionsExecutable() won't work because it doesn't have
-       any virtual address space to grow downwards into. */
+       the file are mapped into memory for ld.so to process. */
     if (isExecutable && startOffset > startPage) {
         debug("shifting new PT_LOAD segment by %d bytes to work around a Linux kernel bug\n", startOffset - startPage);
         startPage = startOffset;
@@ -925,145 +924,6 @@ void ElfFile<ElfFileParamNames>::rewriteSectionsLibrary()
 }
 
 static bool noSort = false;
-
-template<ElfFileParams>
-void ElfFile<ElfFileParamNames>::rewriteSectionsExecutable()
-{
-    if (!noSort) {
-        /* Sort the sections by offset, otherwise we won't correctly find
-           all the sections before the last replaced section. */
-        sortShdrs();
-    }
-
-    /* What is the index of the last replaced section? */
-    unsigned int lastReplaced = 0;
-    for (unsigned int i = 1; i < rdi(hdr()->e_shnum); ++i) {
-        std::string sectionName = getSectionName(shdrs.at(i));
-        if (replacedSections.count(sectionName)) {
-            debug("using replaced section '%s'\n", sectionName.c_str());
-            lastReplaced = i;
-        }
-    }
-
-    assert(lastReplaced != 0);
-
-    debug("last replaced is %d\n", lastReplaced);
-
-    /* Try to replace all sections before that, as far as possible.
-       Stop when we reach an irreplacable section (such as one of type
-       SHT_PROGBITS).  These cannot be moved in virtual address space
-       since that would invalidate absolute references to them. */
-    assert(lastReplaced + 1 < shdrs.size()); /* !!! I'm lazy. */
-    size_t startOffset = rdi(shdrs.at(lastReplaced + 1).sh_offset);
-    Elf_Addr startAddr = rdi(shdrs.at(lastReplaced + 1).sh_addr);
-    std::string prevSection;
-    for (unsigned int i = 1; i <= lastReplaced; ++i) {
-        Elf_Shdr & shdr(shdrs.at(i));
-        std::string sectionName = getSectionName(shdr);
-        debug("looking at section '%s'\n", sectionName.c_str());
-        /* !!! Why do we stop after a .dynstr section? I can't
-           remember! */
-        if ((rdi(shdr.sh_type) == SHT_PROGBITS && sectionName != ".interp")
-            || prevSection == ".dynstr")
-        {
-            startOffset = rdi(shdr.sh_offset);
-            startAddr = rdi(shdr.sh_addr);
-            lastReplaced = i - 1;
-            break;
-        }
-        if (!replacedSections.count(sectionName)) {
-            debug("replacing section '%s' which is in the way\n", sectionName.c_str());
-            replaceSection(sectionName, rdi(shdr.sh_size));
-        }
-        prevSection = std::move(sectionName);
-    }
-
-    debug("first reserved offset/addr is 0x%x/0x%llx\n",
-        startOffset, (unsigned long long) startAddr);
-
-    assert(startAddr % getPageSize() == startOffset % getPageSize());
-    Elf_Addr firstPage = startAddr - startOffset;
-    debug("first page is 0x%llx\n", (unsigned long long) firstPage);
-
-    if (rdi(hdr()->e_shoff) < startOffset) {
-        /* The section headers occur too early in the file and would be
-           overwritten by the replaced sections. Move them to the end of the file
-           before proceeding. */
-        off_t shoffNew = fileContents->size();
-        off_t shSize = rdi(hdr()->e_shoff) + rdi(hdr()->e_shnum) * rdi(hdr()->e_shentsize);
-        fileContents->resize(fileContents->size() + shSize, 0);
-        wri(hdr()->e_shoff, shoffNew);
-
-        /* Rewrite the section header table.  For neatness, keep the
-           sections sorted. */
-        assert(rdi(hdr()->e_shnum) == shdrs.size());
-        sortShdrs();
-        for (unsigned int i = 1; i < rdi(hdr()->e_shnum); ++i)
-            * ((Elf_Shdr *) (fileContents->data() + rdi(hdr()->e_shoff)) + i) = shdrs.at(i);
-    }
-
-
-    normalizeNoteSegments();
-
-
-    /* Compute the total space needed for the replaced sections, the
-       ELF header, and the program headers. */
-    size_t neededSpace = sizeof(Elf_Ehdr) + phdrs.size() * sizeof(Elf_Phdr);
-    for (auto & i : replacedSections)
-        neededSpace += roundUp(i.second.size(), sectionAlignment);
-
-    debug("needed space is %d\n", neededSpace);
-
-    /* If we need more space at the start of the file, then grow the
-       file by the minimum number of pages and adjust internal
-       offsets. */
-    if (neededSpace > startOffset) {
-        /* We also need an additional program header, so adjust for that. */
-        neededSpace += sizeof(Elf_Phdr);
-        debug("needed space is %d\n", neededSpace);
-
-        /* Calculate how many bytes are needed out of the additional pages. */
-        size_t extraSpace = neededSpace - startOffset; 
-        // Always give one extra page to avoid colliding with segments that start at
-        // unaligned addresses and will be rounded down when loaded
-        unsigned int neededPages = 1 + roundUp(extraSpace, getPageSize()) / getPageSize();
-        debug("needed pages is %d\n", neededPages);
-        if (neededPages * getPageSize() > firstPage)
-            error("virtual address space underrun!");
-
-        shiftFile(neededPages, startOffset, extraSpace);
-
-        firstPage -= neededPages * getPageSize();
-        startOffset += neededPages * getPageSize();
-    } else {
-        Elf_Off rewrittenSectionsOffset = sizeof(Elf_Ehdr) + phdrs.size() * sizeof(Elf_Phdr);
-        for (auto& phdr : phdrs)
-            if (rdi(phdr.p_type) == PT_LOAD &&
-                rdi(phdr.p_offset) <= rewrittenSectionsOffset &&
-                rdi(phdr.p_offset) + rdi(phdr.p_filesz) > rewrittenSectionsOffset &&
-                rdi(phdr.p_filesz) < neededSpace)
-            {
-                wri(phdr.p_filesz, neededSpace);
-                wri(phdr.p_memsz, neededSpace);
-                break;
-            }
-    }
-
-
-    /* Clear out the free space. */
-    Elf_Off curOff = sizeof(Elf_Ehdr) + phdrs.size() * sizeof(Elf_Phdr);
-    debug("clearing first %d bytes\n", startOffset - curOff);
-    memset(fileContents->data() + curOff, 0, startOffset - curOff);
-
-
-    /* Write out the replaced sections. */
-    writeReplacedSections(curOff, firstPage, 0);
-    assert(curOff == neededSpace);
-
-
-    rewriteHeaders(firstPage + rdi(hdr()->e_phoff));
-}
-
 
 template<ElfFileParams>
 void ElfFile<ElfFileParamNames>::normalizeNoteSegments()
@@ -1145,11 +1005,11 @@ void ElfFile<ElfFileParamNames>::rewriteSections(bool force)
 
     if (rdi(hdr()->e_type) == ET_DYN) {
         debug("this is a dynamic library\n");
-        rewriteSectionsLibrary();
     } else if (rdi(hdr()->e_type) == ET_EXEC) {
         debug("this is an executable\n");
-        rewriteSectionsExecutable();
+        isExecutable = true;
     } else error("unknown ELF type");
+    rewriteSectionsReal();
 }
 
 
